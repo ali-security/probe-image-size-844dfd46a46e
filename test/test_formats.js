@@ -1333,6 +1333,60 @@ describe('File formats', function () {
       assert.deepStrictEqual(size, { width: 5, height: 5, type: 'svg', mime: 'image/svg+xml', wUnits: 'px', hUnits: 'px' });
     });
 
+    it('ReDoS: should not rescan many `<` without `>` (large chunks)', async function () {
+      let chunks = [ Buffer.from('<svg') ];
+
+      for (let i = 0; i < 16; i++) chunks.push(Buffer.from('<a'.repeat(4096)));
+
+      let start = Date.now();
+
+      await assert.rejects(
+        async () => probe(Readable.from(chunks)),
+        /unrecognized file format/
+      );
+
+      assert.ok(Date.now() - start < 1000, 'svg parser is too slow: ' + (Date.now() - start) + 'ms');
+    });
+
+    it('ReDoS: should not reparse accumulated data on every chunk', async function () {
+      let chunks = [ Buffer.from('<svg') ];
+
+      for (let i = 0; i < 256; i++) chunks.push(Buffer.from('<a'.repeat(32)));
+
+      let start = Date.now();
+
+      await assert.rejects(
+        async () => probe(Readable.from(chunks)),
+        /unrecognized file format/
+      );
+
+      assert.ok(Date.now() - start < 1000, 'svg parser is too slow: ' + (Date.now() - start) + 'ms');
+    });
+
+    it('ReDoS: should not rescan unterminated doctype on every chunk', async function () {
+      let chunks = [ Buffer.from('<!DOCTYPE svg [') ];
+
+      for (let i = 0; i < 4096; i++) chunks.push(Buffer.from(']<a>'));
+
+      let start = Date.now();
+
+      await assert.rejects(
+        async () => probe(Readable.from(chunks)),
+        /unrecognized file format/
+      );
+
+      assert.ok(Date.now() - start < 1000, 'svg parser is too slow: ' + (Date.now() - start) + 'ms');
+    });
+
+    it('ReDoS: should not scan data beyond svg header size limit', async function () {
+      let buf = Buffer.from('<!--' + ' '.repeat(20000) + '--><svg width="5" height="5"></svg>');
+
+      await assert.rejects(
+        async () => probe(Readable.from([ buf ])),
+        /unrecognized file format/
+      );
+    });
+
     /* eslint-disable max-nested-callbacks */
     describe('coverage', function () {
       it('too much data before doctype', async function () {
@@ -1479,6 +1533,32 @@ describe('File formats', function () {
       let size = probe.sync(Buffer.from('\ufeff  <svg width="5" height="4"></svg>'));
 
       assert.deepStrictEqual(size, { width: 5, height: 4, type: 'svg', mime: 'image/svg+xml', wUnits: 'px', hUnits: 'px' });
+    });
+
+    it('should give up on too much data before svg', function () {
+      let tag = Buffer.from('<svg width="5" height="4">');
+
+      // just under the limit
+      assert.deepStrictEqual(
+        probe.sync(Buffer.concat([ Buffer.alloc(10000, 0x20), tag ])),
+        { width: 5, height: 4, type: 'svg', mime: 'image/svg+xml', wUnits: 'px', hUnits: 'px' }
+      );
+
+      assert.strictEqual(probe.sync(Buffer.concat([ Buffer.alloc(20000, 0x20), tag ])), null);
+    });
+
+    it('ReDoS: should not rescan many `<` without `>`', function () {
+      let start = Date.now();
+
+      assert.strictEqual(probe.sync(Buffer.from('<svg' + '<a'.repeat(100000))), null);
+
+      assert.ok(Date.now() - start < 1000, 'svg parser is too slow: ' + (Date.now() - start) + 'ms');
+    });
+
+    it('ReDoS: should not scan data beyond svg header size limit', function () {
+      let buf = Buffer.from('<!--' + ' '.repeat(20000) + '--><svg width="5" height="5"></svg>');
+
+      assert.strictEqual(probe.sync(buf), null);
     });
 
     describe('coverage', function () {
