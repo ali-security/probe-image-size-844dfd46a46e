@@ -3,6 +3,7 @@ env:
   browser:  false
 globals:
   Promise: true
+  Uint8Array: true
 
 ignorePatterns:
   - coverage

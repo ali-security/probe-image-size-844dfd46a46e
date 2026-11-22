@@ -500,6 +500,134 @@ describe('File formats', function () {
     });
 
 
+    it('should read EXIF after ftyp and meta spanning multiple reads', async function () {
+      const padding = Buffer.alloc(8192, 'zzzz');
+      const ftyp = Buffer.from(str2arr(('\0\0\0\0 ftyp avif \0\0\0\0 mif1').replace(/ /g, '')));
+      ftyp.writeUInt32BE(ftyp.length + padding.length, 0);
+
+      const meta = Buffer.from(str2arr((
+        '\0\0\0\0     meta \0\0\0\0' +
+        '  \0\0\0\x26   iinf \0\0\0\0 \0\x01' +
+        '    \0\0\0\x18 infe \0\0\0\0 \0\xAA\0\0 Exif \0\0\0\0' +
+        '  \0\0\0\x1E   iloc \0\0\0\0 \x44\0 \0\x01' +
+        '    \0\xAA \0\0 \0\x01 \0\0\0\0 \0\0\0\0' +
+        '  \0\0\0\x24   iprp' +
+        '    \0\0\0\x1C ipco' +
+        '      \0\0\0\x14 ispe \0\0\0\0 \0\0\0\xC0 \0\0\0\x80' +
+        '  \0\0\0\0     free'
+      ).replace(/ /g, '')));
+      meta.writeUInt32BE(meta.length + padding.length, 0);
+      meta.writeUInt32BE(8 + padding.length, meta.length - 8);
+
+      const mdat = Buffer.from(str2arr(('\0\0\0\0 mdat').replace(/ /g, '')));
+      const exif = Buffer.from(str2arr((
+        '\0\0\0\0' + // TIFF header offset within the EXIF item.
+        'MM \0\x2A \0\0\0\x08 \0\x01' +
+        '\x01\x12 \0\x03 \0\0\0\x01 \0\x06\0\0' + // Orientation = 6.
+        '\0\0\0\0'
+      ).replace(/ /g, '')));
+      mdat.writeUInt32BE(mdat.length + exif.length, 0);
+      const exif_offset = ftyp.length + padding.length + meta.length + padding.length + mdat.length;
+      // The single iloc extent stores an absolute offset and a length.
+      meta.writeUInt32BE(exif_offset, meta.indexOf('iloc') + 18);
+      meta.writeUInt32BE(exif.length, meta.indexOf('iloc') + 22);
+
+      const size = await probe(Readable.from([ ftyp, padding, meta, padding, mdat, exif ]));
+
+      assert.deepStrictEqual(size, {
+        width: 192,
+        height: 128,
+        type: 'avif',
+        mime: 'image/avif',
+        wUnits: 'px',
+        hUnits: 'px',
+        orientation: 6
+      });
+    });
+
+
+    describe('should not buffer attacker-declared box sizes', function () {
+      // ~2GB declared box size, only a prefix of it ever arrives
+      const DECLARED_SIZE = 0x7FFFFFF8;
+      const BOX_READ_SIZE = 4096;
+
+      // Feeds chunks to the avif stream parser, records every buffered read it requests
+      function feedAvifParser(chunks) {
+        const parser = probe.parsers.avif();
+        const bytes = parser._bytes;
+        const reads = [];
+
+        parser._bytes = function (n, fn) {
+          reads.push(n);
+          return bytes.call(this, n, fn);
+        };
+
+        parser.resume();
+
+        return new Promise((resolve, reject) => {
+          parser.on('error', reject);
+          parser.on('finish', () => resolve(reads));
+          for (const chunk of chunks) parser.write(chunk);
+          parser.end();
+        });
+      }
+
+      it('huge ftyp box', async function () {
+        const ftyp = Buffer.from(str2arr('\0\0\0\0ftyp'));
+        ftyp.writeUInt32BE(DECLARED_SIZE, 0);
+        // 4MB of unknown brands
+        const brands = Buffer.alloc(4 * 1024 * 1024, 'zzzz');
+
+        const reads = await feedAvifParser([ ftyp, brands ]);
+
+        assert.ok(Math.max(...reads) <= BOX_READ_SIZE, 'max buffered read: ' + Math.max(...reads));
+        // all received brands are consumed, not accumulated waiting for the declared size
+        assert.ok(reads.reduce((sum, n) => sum + n, 0) >= ftyp.length + brands.length);
+      });
+
+      it('huge meta box', async function () {
+        const ftyp = Buffer.from(str2arr(('\0\0\0\x14 ftyp avif \0\0\0\0 mif1').replace(/ /g, '')));
+        const meta = Buffer.from(str2arr(('\0\0\0\0 meta \0\0\0\0 \0\0\0\0 free').replace(/ /g, '')));
+        meta.writeUInt32BE(DECLARED_SIZE, 0);
+        meta.writeUInt32BE(DECLARED_SIZE - 12, 12);
+        // 4MB of the `free` box content
+        const padding = Buffer.alloc(4 * 1024 * 1024);
+
+        const reads = await feedAvifParser([ ftyp, meta, padding ]);
+
+        assert.ok(Math.max(...reads) <= BOX_READ_SIZE, 'max buffered read: ' + Math.max(...reads));
+        assert.ok(reads.reduce((sum, n) => sum + n, 0) >= ftyp.length + meta.length + padding.length);
+      });
+
+      it('large meta box with image properties after the padding', async function () {
+        const padding = Buffer.alloc(4 * 1024 * 1024);
+        const ftyp = Buffer.from(str2arr(('\0\0\0\x14 ftyp avif \0\0\0\0 mif1').replace(/ /g, '')));
+        const meta = Buffer.from(str2arr((
+          '\0\0\0\0     meta \0\0\0\0' +
+          '  \0\0\0\0   free'
+        ).replace(/ /g, '')));
+        const iprp = Buffer.from(str2arr((
+          '  \0\0\0\x24   iprp' +
+          '    \0\0\0\x1C ipco' +
+          '      \0\0\0\x14 ispe \0\0\0\0 \0\0\0\xC0 \0\0\0\x80'
+        ).replace(/ /g, '')));
+        meta.writeUInt32BE(meta.length + padding.length + iprp.length, 0);
+        meta.writeUInt32BE(8 + padding.length, meta.length - 8);
+
+        const size = await probe(Readable.from([ ftyp, meta, padding, iprp ]));
+
+        assert.deepStrictEqual(size, {
+          width: 192,
+          height: 128,
+          type: 'avif',
+          mime: 'image/avif',
+          wUnits: 'px',
+          hUnits: 'px'
+        });
+      });
+    });
+
+
     it('should detect HEIC - image4.heic', async function () {
       let file = path.join(__dirname, 'fixtures', 'image4.heic');
       let size = await probe(fs.createReadStream(file));
@@ -794,11 +922,11 @@ describe('File formats', function () {
         '\0\0\0\x14 ftyp avif \0\0\0\0 mif1' +
         '\0\0\0\x08 free ' +
         '\0\0\0\x0C free \0\0\0\0 ' +
-        '\0\0\0\x4C meta \0\0\0\0 ' +
+        '\0\0\0\x54 meta \0\0\0\0 ' +
         '\0\0\0\x08 free ' +
-        '\0\0\0\x38 iprp ' +
+        '\0\0\0\x40 iprp ' +
         '\0\0\0\x08 free ' +
-        '\0\0\0\x28 ipco ' +
+        '\0\0\0\x30 ipco ' +
         '\0\0\0\x08 free ' +
         '\0\0\0\x14 ispe \0\0\0\0 \x01\x02\x03\x04 \x05\x06\x07\x08' +
         '\0\0\0\x0C free \0\0\0\0 '
@@ -1202,11 +1330,11 @@ describe('File formats', function () {
         '\0\0\0\x14 ftyp avif \0\0\0\0 mif1' +
         '\0\0\0\x08 free ' +
         '\0\0\0\x0C free \0\0\0\0 ' +
-        '\0\0\0\x4C meta \0\0\0\0 ' +
+        '\0\0\0\x54 meta \0\0\0\0 ' +
         '\0\0\0\x08 free ' +
-        '\0\0\0\x38 iprp ' +
+        '\0\0\0\x40 iprp ' +
         '\0\0\0\x08 free ' +
-        '\0\0\0\x28 ipco ' +
+        '\0\0\0\x30 ipco ' +
         '\0\0\0\x08 free ' +
         '\0\0\0\x14 ispe \0\0\0\0 \x01\x02\x03\x04 \x05\x06\x07\x08' +
         '\0\0\0\x0C free \0\0\0\0 '
