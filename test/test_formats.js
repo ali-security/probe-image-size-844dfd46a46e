@@ -10,6 +10,32 @@ const str2arr = require('../lib/common').str2arr;
 const { Readable } = require('stream');
 
 
+function fixture(s) {
+  return Buffer.from(
+    s.replace(/;.*/mg, '')
+      .match(/[0-9a-f]{2}/gi)
+      .map(i => parseInt(i, 16))
+  );
+}
+
+
+function makeExifWebp(exif_data, exif_length = exif_data.length) {
+  const padding = Buffer.alloc(exif_length % 2);
+  const header = Buffer.alloc(38);
+  header.write('RIFF', 0);
+  header.writeUInt32LE(30 + exif_length + padding.length, 4);
+  header.write('WEBPVP8X', 8);
+  header.writeUInt32LE(10, 16);
+  header[20] = 8; // EXIF flag
+  header[24] = 9; // width - 1
+  header[27] = 9; // height - 1
+  header.write('EXIF', 30);
+  header.writeUInt32LE(exif_length, 34);
+
+  return Buffer.concat([ header, exif_data, padding ]);
+}
+
+
 /* eslint-disable max-len */
 /* eslint-disable no-undefined */
 describe('File formats', function () {
@@ -167,6 +193,30 @@ describe('File formats', function () {
         hUnits: 'px',
         orientation: 5
       });
+    });
+
+
+    it('should read dimensions after a padded EXIF segment', async function () {
+      const file = path.join(__dirname, 'fixtures', 'Exif5-1.5x.jpg');
+      const image = fs.readFileSync(file);
+      const tiff_offset = image.indexOf('Exif\0\0') + 6;
+      const length_offset = tiff_offset - 8;
+      const app1_length = image.readUInt16BE(length_offset);
+      const app1_end = length_offset + app1_length;
+      // EOI markers inside APP1 must not terminate the image.
+      const padding = Buffer.alloc(4096, Buffer.from([ 0xff, 0xd9 ]));
+      const data = Buffer.concat([
+        image.subarray(0, tiff_offset + 8), padding,
+        image.subarray(tiff_offset + 8, app1_end), padding,
+        image.subarray(app1_end)
+      ]);
+      data.writeUInt16BE(app1_length + 2 * padding.length, length_offset);
+      data.writeUInt32LE(8 + padding.length, tiff_offset + 4);
+
+      const size = await probe(Readable.from([ data ]));
+
+      assert.deepStrictEqual(size, probe.sync(image));
+      assert.deepStrictEqual(size, probe.sync(data));
     });
 
 
@@ -432,6 +482,21 @@ describe('File formats', function () {
         hUnits: 'px',
         orientation: 5
       });
+    });
+
+
+    it('should finish before the end of a large EXIF item', async function () {
+      const file = path.join(__dirname, 'fixtures', 'Exif5-1.5x.avif');
+      const image = fs.readFileSync(file);
+      const data = Buffer.concat([ image, Buffer.alloc(4096) ]);
+      const iloc_offset = data.indexOf('iloc') - 4;
+      const iloc_end = iloc_offset + data.readUInt32BE(iloc_offset);
+      // EXIF is the last iloc entry in this fixture; its length occupies the last 4 bytes.
+      data.writeUInt32BE(0x40000000, iloc_end - 4);
+
+      const size = await probe(Readable.from([ data ]));
+
+      assert.deepStrictEqual(size, probe.sync(image));
     });
 
 
@@ -1830,6 +1895,44 @@ describe('File formats', function () {
       let size = await probe(fs.createReadStream(file));
 
       assert.deepStrictEqual(size.orientation, 5);
+    });
+
+
+    it('should finish before the end of a large EXIF chunk', async function () {
+      const exif_data = Buffer.alloc(4096);
+      fixture(`
+        49 49 2A 00 ; little-endian TIFF signature
+        08 00 00 00 ; IFD0 offset
+        01 00 ; IFD0 entry count
+        12 01 03 00 01 00 00 00 06 00 00 00 ; Orientation: SHORT, count = 1, value = 6
+        00 00 00 00 ; no next IFD
+      `).copy(exif_data);
+      const data = makeExifWebp(exif_data, 0x40000000);
+
+      const size = await probe(Readable.from([ data ]));
+
+      assert.strictEqual(size.width, 10);
+      assert.strictEqual(size.height, 10);
+      assert.strictEqual(size.orientation, 6);
+    });
+
+
+    it('should continue reading EXIF after the first chunk', async function () {
+      const ifd0_offset = 4096;
+      const exif_data = Buffer.alloc(ifd0_offset + 18);
+      exif_data.write('II*\0', 0, 'latin1');
+      exif_data.writeUInt32LE(ifd0_offset, 4);
+      exif_data.writeUInt16LE(1, ifd0_offset);
+      exif_data.writeUInt16LE(0x0112, ifd0_offset + 2);
+      exif_data.writeUInt16LE(3, ifd0_offset + 4);
+      exif_data.writeUInt32LE(1, ifd0_offset + 6);
+      exif_data.writeUInt16LE(6, ifd0_offset + 10);
+      const data = makeExifWebp(exif_data);
+
+      const size = await probe(Readable.from([ data ]));
+
+      assert.strictEqual(size.orientation, 6);
+      assert.deepStrictEqual(size, probe.sync(data));
     });
   });
 
